@@ -1,0 +1,66 @@
+# Part 2: Simulation
+
+# ---------- 8) Monte Carlo simulation of realized output ----------
+# Option A: If you have fitted Johnson SB and SuppDists installed, use rJohnson
+use_johnson <- FALSE
+if(use_johnson){
+  if(!requireNamespace("SuppDists", quietly=TRUE)){
+    stop("Please install package 'SuppDists' to draw Johnson SB samples (or set use_johnson = FALSE).")
+  }
+}
+
+nsim <- 1000
+set.seed(123)
+
+# If you don't have full Johnson parameters, we use a Beta distribution with mean = mean_theta and a chosen variance.
+# The user can adjust 'theta_sd_assumed' to reflect dispersion from the fitted Johnson.
+theta_sd_assumed <- 0.1
+
+sim_total_prod <- matrix(0, nrow=nsim, ncol=T)
+sim_shortfall_flag <- matrix(0, nrow=nsim, ncol=T) # indicator if total < demand
+
+for(sim in 1:nsim){
+  theta_draw <- numeric(N)
+  # Draw a single theta per technology per simulate year assumption (could be extended to draw per year)
+  # Here we draw independent thetas for each i,t for simplicity. You can change to per-year draws.
+  theta_mat <- matrix(0, nrow=N, ncol=T)
+  for(i in 1:N){
+    # If using Johnson: sample with rJohnson (requires fitted params)
+    if(use_johnson){
+      # Example placeholder - replace with your fitted parameters for each tech
+      # SuppDists::rJohnson(n=T, parms = c(gamma, delta, xi, lambda), type="SB")
+      stop("Set 'use_johnson <- TRUE' and supply fitted Johnson parameters per technology in the code.")
+    } else {
+      # Beta approximation: match mean and variance
+      mu <- theta_det[i]
+      var_theta <- theta_sd_assumed^2
+      # compute alpha/beta for Beta distribution
+      alpha <- ((1-mu)/var_theta - 1/mu) * mu^2
+      beta <- alpha * (1/mu - 1)
+      if(alpha <= 0 || beta <= 0){
+        # fall back to narrow distribution around mean
+        theta_mat[i,] <- rep(mu, T)
+      } else {
+        theta_mat[i,] <- rbeta(T, alpha, beta)
+      }
+    }
+  }
+  # simulate output each year
+  for(t in 1:T){
+    # capacity at start of year t is X_opt[, t]
+    cap_start <- X_opt[, t]
+    y_it <- (1 - theta_mat[, t]) * capfac_vec * 8760 * cap_start  # MWh produced
+    total_y <- sum(y_it)
+    sim_total_prod[sim, t] <- total_y
+    sim_shortfall_flag[sim, t] <- as.integer(total_y < d)
+  }
+}
+
+# Monte Carlo results
+prob_shortfall_by_year <- colMeans(sim_shortfall_flag)  # probability of falling short each year
+mean_prod_by_year <- colMeans(sim_total_prod)
+
+summary_df <- data.frame(year=1:T,
+                         mean_prod = mean_prod_by_year,
+                         prob_shortfall = prob_shortfall_by_year)
+print(summary_df)
