@@ -1,66 +1,399 @@
-# Part 2: Simulation
+#-------------------- DYNAMIC MODEL: CONSISTENT THETA SCALING + MULTI-SCENARIO ------------------------
 
-# ---------- 8) Monte Carlo simulation of realized output ----------
-# Option A: If you have fitted Johnson SB and SuppDists installed, use rJohnson
-use_johnson <- FALSE
-if(use_johnson){
-  if(!requireNamespace("SuppDists", quietly=TRUE)){
-    stop("Please install package 'SuppDists' to draw Johnson SB samples (or set use_johnson = FALSE).")
-  }
-}
+library(readxl); library(nloptr); library(dplyr)
+library(tidyr); library(ggplot2); library(SuppDists)
 
-nsim <- 1000
+#-------------------- 1. USER/PARAMETERS ------------------------
+input_path   <- "C:/Users/Lunac/OneDrive/Dokumente/UCPH/Master Thesis/Data/model_data.xlsx"
+sheet_name   <- "R_technologies"
+CARBON_FEES  <- c(48.24, 0)
+SCEN_LABELS  <- c("With Carbon Fee", "No Carbon Fee")
+SCEN_COLORS  <- c("With Carbon Fee" = "#3A4E48", "No Carbon Fee" = "#BEB0A7")
+T            <- 30            # time horizon (years)
+nsim         <- 100          # number of simulation runs per scenario
+target_mean  <- 0.10          # desired mean theta for all techs
 set.seed(123)
 
-# If you don't have full Johnson parameters, we use a Beta distribution with mean = mean_theta and a chosen variance.
-# The user can adjust 'theta_sd_assumed' to reflect dispersion from the fitted Johnson.
-theta_sd_assumed <- 0.1
+#-------------------- 2. LOAD DATA & JOHNSON SB PARAMETERS ------------------------
+df <- read_excel(input_path, sheet = sheet_name) %>%
+  rename(
+    tech = tech,      I = I_i,       c = c_i,
+    starting_cap = starting_cap, capfac = cap_factor,
+    e = e_i, mean_theta = mean_theta, eta = depreciation
+  )
+techs <- df$tech; N <- nrow(df)
+d_raw <- 246344038.11; s <- 0.95; sd_raw <- s * d_raw
+cap_scale <- 1e3; gen_scale <- 1e3
+d <- sd_raw / gen_scale     # demand in GWh/year
 
-sim_total_prod <- matrix(0, nrow=nsim, ncol=T)
-sim_shortfall_flag <- matrix(0, nrow=nsim, ncol=T) # indicator if total < demand
+I_vec <- as.numeric(df$I); c_vec <- as.numeric(df$c)
+capfac_vec <- as.numeric(df$capfac); eta_vec <- as.numeric(df$eta)
+x0_raw <- as.numeric(df$starting_cap); x0 <- x0_raw / cap_scale
+emissions <- as.numeric(df$e)
+# Johnson SB parameters
+gamma_vec  <- df$gamma; delta_vec  <- df$delta
+xi_vec     <- df$xi;    lambda_vec <- df$lambda
 
-for(sim in 1:nsim){
-  theta_draw <- numeric(N)
-  # Draw a single theta per technology per simulate year assumption (could be extended to draw per year)
-  # Here we draw independent thetas for each i,t for simplicity. You can change to per-year draws.
-  theta_mat <- matrix(0, nrow=N, ncol=T)
-  for(i in 1:N){
-    # If using Johnson: sample with rJohnson (requires fitted params)
-    if(use_johnson){
-      # Example placeholder - replace with your fitted parameters for each tech
-      # SuppDists::rJohnson(n=T, parms = c(gamma, delta, xi, lambda), type="SB")
-      stop("Set 'use_johnson <- TRUE' and supply fitted Johnson parameters per technology in the code.")
-    } else {
-      # Beta approximation: match mean and variance
-      mu <- theta_det[i]
-      var_theta <- theta_sd_assumed^2
-      # compute alpha/beta for Beta distribution
-      alpha <- ((1-mu)/var_theta - 1/mu) * mu^2
-      beta <- alpha * (1/mu - 1)
-      if(alpha <= 0 || beta <= 0){
-        # fall back to narrow distribution around mean
-        theta_mat[i,] <- rep(mu, T)
-      } else {
-        theta_mat[i,] <- rbeta(T, alpha, beta)
-      }
-    }
-  }
-  # simulate output each year
-  for(t in 1:T){
-    # capacity at start of year t is X_opt[, t]
-    cap_start <- X_opt[, t]
-    y_it <- (1 - theta_mat[, t]) * capfac_vec * 8760 * cap_start  # MWh produced
-    total_y <- sum(y_it)
-    sim_total_prod[sim, t] <- total_y
-    sim_shortfall_flag[sim, t] <- as.integer(total_y < d)
-  }
+# Confirm tech order matches param_sets if used!
+param_sets <- vector("list", length(techs))
+for (i in seq_along(techs)) {
+  param_sets[[i]] <- list(
+    gamma = gamma_vec[i],
+    delta = delta_vec[i],
+    xi = xi_vec[i],
+    lambda = lambda_vec[i],
+    label = techs[i]
+  )
 }
 
-# Monte Carlo results
-prob_shortfall_by_year <- colMeans(sim_shortfall_flag)  # probability of falling short each year
-mean_prod_by_year <- colMeans(sim_total_prod)
+#----------------
+# Proportional theta scaling setup
+#----------------
 
-summary_df <- data.frame(year=1:T,
-                         mean_prod = mean_prod_by_year,
-                         prob_shortfall = prob_shortfall_by_year)
-print(summary_df)
+# Instead of calculating Johnson SB means, just use mean_theta from Excel
+orig_means <- as.numeric(df$mean_theta)
+
+# 2. Find max mean and scaling factor
+max_orig_mean <- max(orig_means)
+target_max_theta <- 0.10 # highest mean theta after scaling
+
+scaling_factor <- 0.143616257 # target_max_theta / max_orig_mean
+
+# 3. Compute final values for use in model
+scaled_mean_theta <- orig_means * scaling_factor # deterministic theta in optimization (Part 1)
+scaling_factors <- rep(scaling_factor, length(orig_means)) # for all techs in simulation
+
+print("Scaled mean theta per technology:")
+for(i in 1:N) cat(sprintf("%s: %.4f\n", techs[i], scaled_mean_theta[i]))
+
+# 4. Diagnostic table
+theta_scaling_table <- data.frame(
+  Technology = sapply(param_sets, `[[`, "label"),
+  OrigMeanTheta = orig_means,
+  ScalingFactor = scaling_factors,
+  ScaledMeanTheta = scaled_mean_theta
+)
+print(theta_scaling_table, digits=3)
+write.csv(theta_scaling_table, "theta_scaling_summary.csv", row.names=FALSE)
+
+#------------------- 4. SCENARIO RUNNER (Part 1 + Part 2 consistent theta) --------------------------
+run_scenario <- function(carbon_fee, T, nsim,
+                         gamma_vec, delta_vec, xi_vec, lambda_vec,
+                         scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta) {
+  N <- length(techs)
+  nvars <- 2 * N * T
+  idx_invest <- function(i, t) (i-1)*T + t
+  idx_gen    <- function(i, t) N*T + (i-1)*T + t
+  I_scaled <- I_vec * 1e6
+  
+  compute_capacity_path <- function(v){
+    X <- matrix(0, nrow=N, ncol=T+1); X[,1] <- x0
+    for(t in 1:T) for(i in 1:N)
+      X[i, t+1] <- (1 - eta_vec[i]) * X[i, t] + v[idx_invest(i, t)]
+    X
+  }
+  # Objective (Part 1)
+  objective_fn <- function(v){
+    X <- compute_capacity_path(v); total <- 0
+    for(t in 1:T){
+      disc <- 1 / ((1 + 0.03)^(t - 1))
+      for(i in 1:N){
+        inv_gw <- v[idx_invest(i,t)]; gen_gwh <- v[idx_gen(i,t)]
+        gen_mwh <- gen_gwh * gen_scale
+        total <- total + disc * ( I_scaled[i] * inv_gw^2 + c_vec[i] * gen_mwh + carbon_fee * emissions[i] * gen_mwh )
+      }
+    }
+    as.numeric(total)
+  }
+  # Constraints
+  eval_g_ineq <- function(v){
+    X <- compute_capacity_path(v)
+    constr <- c()
+    for(t in 1:T){
+      sumg_gwh <- sum(sapply(1:N, function(i) v[idx_gen(i,t)]))
+      constr <- c(constr, d - sumg_gwh)
+    }
+    for(i in 1:N){
+      for(t in 1:T){
+        g_it_gwh <- v[idx_gen(i,t)]
+        cap_gw <- X[i, t]
+        avail_gwh <- (1 - scaled_mean_theta[i]) * capfac_vec[i] * cap_gw * 8760
+        constr <- c(constr, 1/1000000 * (g_it_gwh - avail_gwh))
+      }
+    }
+    for(i in 1:N) for(t in 1:(T+1)) constr <- c(constr, - X[i, t])
+    constr
+  }
+  # Initial guess & bounds
+  invest_init <- rep(0.6, N * T); gen_init <- rep(d / N, N * T)
+  x0_guess <- c(invest_init, gen_init)
+  opts <- list(algorithm = "NLOPT_LN_COBYLA", xtol_rel = 1e-6, ftol_rel = 1e-8, maxeval = 100000)
+  lower_bounds <- rep(0, nvars)
+  upper_bounds <- c(rep(20, N*T), rep(d, N*T))
+  res <- nloptr(x0 = x0_guess, eval_f = objective_fn, lb = lower_bounds, ub = upper_bounds,
+                eval_g_ineq = eval_g_ineq, opts = opts)
+  v_opt <- res$solution
+  # Extract investments & generation
+  invest_opt <- matrix(0, N, T); gen_opt <- matrix(0, N, T)
+  for(i in 1:N) for(t in 1:T){
+    invest_opt[i,t] <- v_opt[idx_invest(i, t)]; gen_opt[i,t] <- v_opt[idx_gen(i, t)]
+  }
+  X_opt <- compute_capacity_path(v_opt)
+  # Annual deterministic cost/emissions
+  det_cost <- sapply(1:T, function(t)
+    sum(sapply(1:N, function(i){
+      inv_gw  <- invest_opt[i, t]; gen_gwh <- gen_opt[i, t]
+      gen_mwh <- gen_gwh * gen_scale
+      I_scaled[i] * inv_gw^2 + c_vec[i] * gen_mwh + carbon_fee * emissions[i] * gen_mwh
+    }))
+  )
+  det_emis <- sapply(1:T, function(t) sum(sapply(1:N, function(i) emissions[i]*gen_opt[i, t]*gen_scale)))
+  
+  # -------- SIMULATION: θ sampled from scaled Johnson SB distributions ---------
+  sim_realized_gen <- array(0, dim = c(nsim, N, T)); sim_emis_year <- matrix(0, nsim, T)
+  sim_cost_per_year <- matrix(0, nsim, T); sim_total_prod <- matrix(0, nsim, T)
+  sim_shortfall_flag <- matrix(0, nsim, T); sim_shortfall_amount <- matrix(0, nsim, T)
+  for(sim in 1:nsim){
+    theta_mat <- matrix(0, nrow=N, ncol=T)
+    for (i in 1:N) {
+      mu    <- -gamma_vec[i] / delta_vec[i]
+      sigma <- 1 / delta_vec[i]
+      theta_raw <- plogis(rnorm(T, mu, sigma))
+      theta_scaled <- scaling_factor * theta_raw # proportional scaling for all techs
+      theta_scaled <- pmin(pmax(theta_scaled, 0), 1)
+      theta_mat[i, ] <- theta_scaled
+    }
+    for(t in 1:T){
+      cap_start <- X_opt[, t]; total_y <- 0; emis_y <- 0
+      for(i in 1:N){
+        gen_mwh <- (1 - theta_mat[i, t]) * capfac_vec[i] * 8760 * cap_start[i]
+        sim_realized_gen[sim, i, t] <- gen_mwh; total_y <- total_y + gen_mwh
+        emis_y <- emis_y + emissions[i]*gen_mwh
+      }
+      sim_total_prod[sim, t] <- total_y
+      sim_shortfall_flag[sim, t] <- as.integer(total_y < d)
+      sim_shortfall_amount[sim, t] <- max(d-total_y, 0)
+      total_cost <- sum(sapply(1:N, function(i){
+        inv_gw <- invest_opt[i, t]; gen_mwh <- sim_realized_gen[sim, i, t]
+        I_scaled[i]*inv_gw^2 + c_vec[i]*gen_mwh + carbon_fee*emissions[i]*gen_mwh
+      }))
+      sim_cost_per_year[sim, t] <- total_cost; sim_emis_year[sim, t] <- emis_y
+    }
+  }
+  # Summary statistics
+  mean_sim_cost <- colMeans(sim_cost_per_year)
+  cost_p5       <- apply(sim_cost_per_year, 2, function(x) quantile(x, 0.05))
+  cost_p95      <- apply(sim_cost_per_year, 2, function(x) quantile(x, 0.95))
+  mean_sim_emis <- colMeans(sim_emis_year)
+  emis_p5       <- apply(sim_emis_year, 2, function(x) quantile(x, 0.05))
+  emis_p95      <- apply(sim_emis_year, 2, function(x) quantile(x, 0.95))
+  prob_shortfall_by_year  <- colMeans(sim_shortfall_flag)
+  mean_shortfall_by_year  <- colMeans(sim_shortfall_amount)
+  nonzero_shortfall_mean  <- sapply(1:T, function(tt) {
+    vals <- sim_shortfall_amount[, tt]; nnz <- vals[vals > 0]
+    if(length(nnz)>0) mean(nnz) else 0
+  })
+  cap_Tplus1 <- X_opt[, T+1]
+  # Utilization table
+  max_possible_by_tech_year <- sapply(1:N, function(i) capfac_vec[i] * 8760 * X_opt[i, 1:T])
+  mean_gen_by_tech_year <- sapply(1:N, function(i) colMeans(sim_realized_gen[, i, ]))
+  share_used <- mean_gen_by_tech_year / max_possible_by_tech_year
+  util_df <- data.frame(
+    tech = rep(techs, each = T), year = rep(1:T, times = N), share = as.vector(t(share_used))
+  )
+  # Return all results
+  list(
+    det_cost = det_cost, det_emis = det_emis,
+    mean_sim_cost = mean_sim_cost, cost_p5 = cost_p5, cost_p95 = cost_p95,
+    mean_sim_emis = mean_sim_emis, emis_p5 = emis_p5, emis_p95 = emis_p95,
+    prob_shortfall = prob_shortfall_by_year,
+    mean_shortfall = mean_shortfall_by_year,
+    mean_shortfall_if = nonzero_shortfall_mean,
+    util_df = util_df, cap_end = cap_Tplus1, techs = techs,
+    invest_opt = invest_opt, X_opt = X_opt, gen_opt = gen_opt,
+    # Optionally: deterministic/scaled theta and scaling used
+    mean_theta_per_tech = scaled_mean_theta,
+    scaling_factors = scaling_factors
+  )
+}
+
+#--------------------- 1. (RECOMMENDED) SCENARIO LIST BY NAME -----------------------
+results <- list()
+results[["With Carbon Fee"]] <- run_scenario(CARBON_FEES[1], T, nsim,
+                                             gamma_vec, delta_vec, xi_vec, lambda_vec,
+                                             scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta)
+results[["No Carbon Fee"]]   <- run_scenario(CARBON_FEES[2], T, nsim,
+                                             gamma_vec, delta_vec, xi_vec, lambda_vec,
+                                             scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta)
+
+SCEN_LABELS <- c("With Carbon Fee", "No Carbon Fee")
+SCEN_COLORS <- c("With Carbon Fee" = "#3A4E48", "No Carbon Fee" = "#BEB0A7")
+
+#--------------------- 2. PLOT SHORTFALL PROBABILITY --------------------------------
+steady_state_start <- 1      # Change this for other definitions, e.g. 26 for last 5 years
+steady_state_end <- T-5         # or e.g. T for last (T-steady_state_start+1) years
+steady_years <- steady_state_start:steady_state_end
+
+dfshortfall_wide <- data.frame(
+  Year = 1:T,
+  "With Carbon Fee" = results[["With Carbon Fee"]]$prob_shortfall,
+  "No Carbon Fee"   = results[["No Carbon Fee"]]$prob_shortfall,
+  check.names = FALSE
+)
+dfshortfall_long <- tidyr::pivot_longer(
+  dfshortfall_wide,
+  cols = c("With Carbon Fee", "No Carbon Fee"),
+  names_to = "Scenario",
+  values_to = "ProbShortfall"
+)
+dfshortfall_long_ss <- dplyr::filter(dfshortfall_long, Year %in% steady_years)
+ggplot(dfshortfall_long_ss, aes(x=Year, y=ProbShortfall, color=Scenario)) +
+  geom_line(size=1.5) +
+  scale_color_manual(values = SCEN_COLORS) +
+  labs(
+    title = paste("Probability of Not Meeting Reliability Goal (Steady State, Years", steady_state_start, "to", steady_state_end, ")"),
+    y = "Shortfall Probability"
+  ) +
+  theme_minimal()
+
+#--------------------- 3. INVESTMENT OVER TIME BY TECH ---------------------------------
+plot_investment <- function(scen_results, scenario_name, color_map=color_palette) {
+  invest_df <- data.frame(
+    tech = rep(scen_results$techs, each = T),
+    year = rep(1:T, times = N),
+    invest_GW = as.vector(t(scen_results$invest_opt))
+  )
+  invest_df_ss <- dplyr::filter(invest_df, year %in% steady_years)
+  ggplot(invest_df_ss, aes(x=year, y=invest_GW, color=tech)) +
+    geom_line(size=1.5) +
+    scale_color_manual(values=color_map) +
+    labs(
+      title = paste("Investment by Technology per Year (Steady State, Years", steady_state_start, "to", steady_state_end, ") -", scenario_name),
+      x = "Year", y = "Investment (GW/year)", color = "Technology"
+    ) +
+    theme_minimal() + theme(legend.position="bottom")
+}
+plot_investment(results[["With Carbon Fee"]], "With Carbon Fee")
+plot_investment(results[["No Carbon Fee"]], "No Carbon Fee")
+
+#--------------------- 4. UTILIZATION (one plot per scenario) ----------------------------
+for(this_scenario in SCEN_LABELS) {
+  plotdata <- results[[this_scenario]]$util_df
+  plotdata_ss <- dplyr::filter(plotdata, year %in% steady_years)
+  print(
+    ggplot(plotdata_ss, aes(x = year, y = share, color = tech)) +
+      geom_line(size = 1.2) +
+      scale_color_manual(values = color_palette) +
+      labs(
+        title = paste("Utilization by Technology (Steady State, Years", steady_state_start, "to", steady_state_end, ") -", this_scenario),
+        x = "Year", y = "Mean Capacity Utilization"
+      ) +
+      ylim(0, 1) +
+      theme_minimal() +
+      theme(legend.position = "bottom")
+  )
+}
+
+#--------------------- 5. CAPACITY MIX/STACKED AREA ONE PLOT PER SCENARIO -------------
+plot_capacity_mix <- function(scen_results, scenario_name, color_map=color_palette) {
+  Xlong <- data.frame(
+    tech = rep(scen_results$techs, each = T+1),
+    year = rep(0:T, times = N),
+    capacity_GW = as.vector(t(scen_results$X_opt))
+  )
+  # Focus on steady state years
+  Xlong_ss <- dplyr::filter(Xlong, year %in% steady_years)
+  ggplot(Xlong_ss, aes(x = year, y = capacity_GW, fill = tech)) +
+    geom_area(alpha=0.9, color="black", size=0.2, position="stack") +
+    scale_fill_manual(values=color_map) +
+    labs(
+      title = paste("Capacity Mix Over Time (Steady State, Years", steady_state_start, "to", steady_state_end, ") -", scenario_name),
+      x = "Year", y = "Capacity (GW)", fill="Technology"
+    ) +
+    theme_minimal() + theme(legend.position = "bottom")
+}
+plot_capacity_mix(results[["With Carbon Fee"]], "With Carbon Fee")
+plot_capacity_mix(results[["No Carbon Fee"]], "No Carbon Fee")
+
+#--------------------- 6. BAR PLOT OF FINAL CAPACITY BY SCENARIO ------------------------
+capmix_df <- data.frame(
+  tech = results[["With Carbon Fee"]]$techs,
+  "With Carbon Fee" = results[["With Carbon Fee"]]$cap_end,
+  "No Carbon Fee"   = results[["No Carbon Fee"]]$cap_end,
+  check.names = FALSE
+)
+capmix_long <- tidyr::pivot_longer(
+  capmix_df,
+  cols = all_of(SCEN_LABELS),
+  names_to = "Scenario",
+  values_to = "Capacity"
+)
+ggplot(capmix_long, aes(x=tech, y=Capacity, fill=Scenario)) +
+  geom_col(position="dodge") +
+  scale_fill_manual(values=SCEN_COLORS) +
+  labs(title="Installed Capacity at Simulation End", x="Technology", y="Capacity (GW)", fill="Scenario") +
+  theme_minimal()
+
+#--------------------- 7. DIFFERENCE PLOTS --------------------------------------------
+# ---- Capacity difference at simulation end STILL MAKES SENSE TO SHOW (end-of-T barplot) ----
+delta_cap_df <- data.frame(
+  tech = results[["With Carbon Fee"]]$techs,
+  diff = results[["With Carbon Fee"]]$cap_end - results[["No Carbon Fee"]]$cap_end
+)
+ggplot(delta_cap_df, aes(x = tech, y = diff, fill = tech)) +
+  geom_col(width = 0.7) +
+  scale_fill_manual(values = color_palette) +
+  labs(title = "Difference in Final Capacity (With Carbon Fee - No Carbon Fee)",
+       x = "Technology", y = "Capacity Difference (GW)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+# ---- Investment difference per year in steady-state ----
+invest1 <- results[["With Carbon Fee"]]$invest_opt
+invest2 <- results[["No Carbon Fee"]]$invest_opt
+delta_invest <- invest1 - invest2
+invest_diff_df <- data.frame(
+  tech = rep(techs, each = T),
+  year = rep(1:T, times = N),
+  diff = as.vector(t(delta_invest))
+)
+# Filter for steady-state years
+invest_diff_df_ss <- dplyr::filter(invest_diff_df, year %in% steady_years)
+ggplot(invest_diff_df_ss, aes(x = year, y = diff, color = tech)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = color_palette) +
+  labs(
+    title = paste("Difference in Annual Investment (With - Without Carbon Fee), Years", steady_state_start, "to", steady_state_end),
+    x = "Year", y = "Investment Difference (GW/year)", color = "Technology"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# ---- Generation difference per year in steady-state ----
+gen1 <- results[["With Carbon Fee"]]$gen_opt
+gen2 <- results[["No Carbon Fee"]]$gen_opt
+delta_gen <- gen1 - gen2
+gen_diff_df <- data.frame(
+  tech = rep(techs, each = T),
+  year = rep(1:T, times = N),
+  diff = as.vector(t(delta_gen))
+)
+# Filter for steady-state years
+gen_diff_df_ss <- dplyr::filter(gen_diff_df, year %in% steady_years)
+ggplot(gen_diff_df_ss, aes(x = year, y = diff, color = tech)) +
+  geom_line(size = 1.2) +
+  scale_color_manual(values = color_palette) +
+  labs(
+    title = paste("Difference in Annual Generation (With - Without Carbon Fee), Years", steady_state_start, "to", steady_state_end),
+    x = "Year", y = "Generation Difference (GWh)", color = "Technology"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#--------------------- 8. EXPORTS (EXAMPLE) -------------------------------------------
+write.csv(dfshortfall_long,         "sim_shortfall_prob_comparison.csv",         row.names=FALSE)
+write.csv(capmix_long,              "final_capacity_mix_comparison.csv",         row.names=FALSE)
+write.csv(invest_diff_df,           "investment_diff_comparison.csv",            row.names=FALSE)
+write.csv(gen_diff_df,              "generation_diff_comparison.csv",            row.names=FALSE)
+
+#--------------------- END -----------------------------------------------------------
