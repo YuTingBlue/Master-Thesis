@@ -1,18 +1,26 @@
-#-------------------- DYNAMIC MODEL: CONSISTENT THETA SCALING + MULTI-SCENARIO ------------------------
+#----------------------- DYNAMIC MODEL ---------------------------
 
 library(readxl); library(nloptr); library(dplyr)
 library(tidyr); library(ggplot2); library(SuppDists)
+library(scales)
 
-#-------------------- 1. USER/PARAMETERS ------------------------
+#-------------------- 1. PARAMETERS ------------------------
 input_path   <- "C:/Users/Lunac/OneDrive/Dokumente/UCPH/Master Thesis/Data/model_data.xlsx"
 sheet_name   <- "R_technologies"
 CARBON_FEES  <- c(48.24, 0)
 SCEN_LABELS  <- c("With Carbon Fee", "No Carbon Fee")
 SCEN_COLORS  <- c("With Carbon Fee" = "#3A4E48", "No Carbon Fee" = "#BEB0A7")
-T            <- 30            # time horizon (years)
-nsim         <- 100          # number of simulation runs per scenario
-target_mean  <- 0.10          # desired mean theta for all techs
+TECH_COLORS <- c(
+  "Coal" = "#8B3A3A",
+  "LNG" = "#607B8B",
+  "Offshore_wind" = "#979461",
+  "Solar_PV" = "#CD5733"
+)
+T            <- 15            # time horizon (years)
+nsim         <- 30          # number of simulation runs per scenario
 set.seed(123)
+
+color_palette <- TECH_COLORS
 
 #-------------------- 2. LOAD DATA & JOHNSON SB PARAMETERS ------------------------
 df <- read_excel(input_path, sheet = sheet_name) %>%
@@ -46,17 +54,12 @@ for (i in seq_along(techs)) {
   )
 }
 
-#----------------
-# Proportional theta scaling setup
-#----------------
+#---------------- 3. Proportional theta scaling setup ----------------------------
 
-# Instead of calculating Johnson SB means, just use mean_theta from Excel
+# 1. Use mean_theta from Excel
 orig_means <- as.numeric(df$mean_theta)
 
-# 2. Find max mean and scaling factor
-max_orig_mean <- max(orig_means)
-target_max_theta <- 0.10 # highest mean theta after scaling
-
+# 2. Set scaling factor
 scaling_factor <- 0.143616257 # target_max_theta / max_orig_mean
 
 # 3. Compute final values for use in model
@@ -73,18 +76,23 @@ theta_scaling_table <- data.frame(
   ScalingFactor = scaling_factors,
   ScaledMeanTheta = scaled_mean_theta
 )
-print(theta_scaling_table, digits=3)
-write.csv(theta_scaling_table, "theta_scaling_summary.csv", row.names=FALSE)
+#print(theta_scaling_table, digits=3)
+#write.csv(theta_scaling_table, "theta_scaling_summary.csv", row.names=FALSE)
 
-#------------------- 4. SCENARIO RUNNER (Part 1 + Part 2 consistent theta) --------------------------
+#---------------------- 4. SCENARIO RUNNER ----------------------------
 run_scenario <- function(carbon_fee, T, nsim,
                          gamma_vec, delta_vec, xi_vec, lambda_vec,
-                         scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta) {
+                         scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta,
+                         # ... inside the list(...) that run_scenario returns, add:
+                         mean_gen_by_tech_year = mean_gen_by_tech_year,   # N x T matrix (GWh) : mean across sims
+                         sim_realized_gen = sim_realized_gen             # nsim x N x T array (GWh) : full simulation draws
+) {
   N <- length(techs)
   nvars <- 2 * N * T
   idx_invest <- function(i, t) (i-1)*T + t
   idx_gen    <- function(i, t) N*T + (i-1)*T + t
   I_scaled <- I_vec * 1e6
+  
   
   compute_capacity_path <- function(v){
     X <- matrix(0, nrow=N, ncol=T+1); X[,1] <- x0
@@ -92,7 +100,9 @@ run_scenario <- function(carbon_fee, T, nsim,
       X[i, t+1] <- (1 - eta_vec[i]) * X[i, t] + v[idx_invest(i, t)]
     X
   }
-  # Objective (Part 1)
+  
+#---------------------- PART 1 Optimization ----------------------------
+  
   objective_fn <- function(v){
     X <- compute_capacity_path(v); total <- 0
     for(t in 1:T){
@@ -149,10 +159,15 @@ run_scenario <- function(carbon_fee, T, nsim,
   )
   det_emis <- sapply(1:T, function(t) sum(sapply(1:N, function(i) emissions[i]*gen_opt[i, t]*gen_scale)))
   
-  # -------- SIMULATION: θ sampled from scaled Johnson SB distributions ---------
+#---------------------- PART 2 SIMULATION: θ sampled from scaled Johnson SB distributions ----------------------------
+  
   sim_realized_gen <- array(0, dim = c(nsim, N, T)); sim_emis_year <- matrix(0, nsim, T)
   sim_cost_per_year <- matrix(0, nsim, T); sim_total_prod <- matrix(0, nsim, T)
   sim_shortfall_flag <- matrix(0, nsim, T); sim_shortfall_amount <- matrix(0, nsim, T)
+  # Matrix to store variable costs per simulation, tech, and year
+  var_cost_per_tech_year <- array(0, dim = c(nsim, N, T))  # nsim x tech x year
+  mean_gen_by_tech_year <- sapply(1:N, function(i) colMeans(sim_realized_gen[, i, ]))
+  
   for(sim in 1:nsim){
     theta_mat <- matrix(0, nrow=N, ncol=T)
     for (i in 1:N) {
@@ -169,19 +184,26 @@ run_scenario <- function(carbon_fee, T, nsim,
         gen_mwh <- (1 - theta_mat[i, t]) * capfac_vec[i] * 8760 * cap_start[i]
         sim_realized_gen[sim, i, t] <- gen_mwh; total_y <- total_y + gen_mwh
         emis_y <- emis_y + emissions[i]*gen_mwh
+        var_cost_per_tech_year[sim, i, t] <- c_vec[i] * gen_mwh
       }
       sim_total_prod[sim, t] <- total_y
       sim_shortfall_flag[sim, t] <- as.integer(total_y < d)
       sim_shortfall_amount[sim, t] <- max(d-total_y, 0)
       total_cost <- sum(sapply(1:N, function(i){
-        inv_gw <- invest_opt[i, t]; gen_mwh <- sim_realized_gen[sim, i, t]
-        I_scaled[i]*inv_gw^2 + c_vec[i]*gen_mwh + carbon_fee*emissions[i]*gen_mwh
+        inv_gw <- invest_opt[i, t]
+        gen_gwh_sim <- sim_realized_gen[sim, i, t]     # this is in GWh
+        gen_mwh_sim <- gen_gwh_sim * gen_scale         # convert to MWh
+        I_scaled[i] * inv_gw^2 + c_vec[i] * gen_mwh_sim + carbon_fee * emissions[i] * gen_mwh_sim
       }))
       sim_cost_per_year[sim, t] <- total_cost; sim_emis_year[sim, t] <- emis_y
     }
   }
   # Summary statistics
   mean_sim_cost <- colMeans(sim_cost_per_year)
+  
+  
+  # keep existing returned elements ...
+  mean_var_cost_per_tech_year <- apply(var_cost_per_tech_year, c(2, 3), mean)  # Average over nsim
   cost_p5       <- apply(sim_cost_per_year, 2, function(x) quantile(x, 0.05))
   cost_p95      <- apply(sim_cost_per_year, 2, function(x) quantile(x, 0.95))
   mean_sim_emis <- colMeans(sim_emis_year)
@@ -194,6 +216,7 @@ run_scenario <- function(carbon_fee, T, nsim,
     if(length(nnz)>0) mean(nnz) else 0
   })
   cap_Tplus1 <- X_opt[, T+1]
+  
   # Utilization table
   max_possible_by_tech_year <- sapply(1:N, function(i) capfac_vec[i] * 8760 * X_opt[i, 1:T])
   mean_gen_by_tech_year <- sapply(1:N, function(i) colMeans(sim_realized_gen[, i, ]))
@@ -201,6 +224,7 @@ run_scenario <- function(carbon_fee, T, nsim,
   util_df <- data.frame(
     tech = rep(techs, each = T), year = rep(1:T, times = N), share = as.vector(t(share_used))
   )
+  
   # Return all results
   list(
     det_cost = det_cost, det_emis = det_emis,
@@ -211,27 +235,34 @@ run_scenario <- function(carbon_fee, T, nsim,
     mean_shortfall_if = nonzero_shortfall_mean,
     util_df = util_df, cap_end = cap_Tplus1, techs = techs,
     invest_opt = invest_opt, X_opt = X_opt, gen_opt = gen_opt,
-    # Optionally: deterministic/scaled theta and scaling used
     mean_theta_per_tech = scaled_mean_theta,
-    scaling_factors = scaling_factors
+    mean_sim_total_prod = colMeans(sim_total_prod),  
+    sim_cost_per_year = sim_cost_per_year,           
+    sim_total_prod = sim_total_prod,                
+    scaling_factors = scaling_factors,
+    mean_gen_by_tech_year = mean_gen_by_tech_year,
+    mean_var_cost_per_tech_year = mean_var_cost_per_tech_year
   )
 }
 
-#--------------------- 1. (RECOMMENDED) SCENARIO LIST BY NAME -----------------------
+#--------------------- 5. SCENARIO LIST BY NAME ----------------------------
 results <- list()
 results[["With Carbon Fee"]] <- run_scenario(CARBON_FEES[1], T, nsim,
                                              gamma_vec, delta_vec, xi_vec, lambda_vec,
-                                             scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta)
+                                             scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta,   # ... inside the list(...) that run_scenario returns, add:
+                                             mean_gen_by_tech_year = mean_gen_by_tech_year,   # N x T matrix (GWh) : mean across sims
+                                             sim_realized_gen = sim_realized_gen             # nsim x N x T array (GWh) : full simulation draws
+)
 results[["No Carbon Fee"]]   <- run_scenario(CARBON_FEES[2], T, nsim,
                                              gamma_vec, delta_vec, xi_vec, lambda_vec,
-                                             scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta)
+                                             scaling_factors, capfac_vec, I_vec, c_vec, eta_vec, x0, emissions, d, techs, scaled_mean_theta,   # ... inside the list(...) that run_scenario returns, add:
+                                             mean_gen_by_tech_year = mean_gen_by_tech_year,   # N x T matrix (GWh) : mean across sims
+                                             sim_realized_gen = sim_realized_gen             # nsim x N x T array (GWh) : full simulation draws
+)
 
-SCEN_LABELS <- c("With Carbon Fee", "No Carbon Fee")
-SCEN_COLORS <- c("With Carbon Fee" = "#3A4E48", "No Carbon Fee" = "#BEB0A7")
-
-#--------------------- 2. PLOT SHORTFALL PROBABILITY --------------------------------
-steady_state_start <- 1      # Change this for other definitions, e.g. 26 for last 5 years
-steady_state_end <- T-5         # or e.g. T for last (T-steady_state_start+1) years
+#--------------------- 6. PLOT SHORTFALL PROBABILITY --------------------------------
+steady_state_start <- 1      # year 1 that is plotted, naming can be misleading
+steady_state_end <- T-6         # last year that is plotted
 steady_years <- steady_state_start:steady_state_end
 
 dfshortfall_wide <- data.frame(
@@ -256,7 +287,7 @@ ggplot(dfshortfall_long_ss, aes(x=Year, y=ProbShortfall, color=Scenario)) +
   ) +
   theme_minimal()
 
-#--------------------- 3. INVESTMENT OVER TIME BY TECH ---------------------------------
+#--------------------- 7. INVESTMENT OVER TIME BY TECH ---------------------------------
 plot_investment <- function(scen_results, scenario_name, color_map=color_palette) {
   invest_df <- data.frame(
     tech = rep(scen_results$techs, each = T),
@@ -274,27 +305,27 @@ plot_investment <- function(scen_results, scenario_name, color_map=color_palette
     theme_minimal() + theme(legend.position="bottom")
 }
 plot_investment(results[["With Carbon Fee"]], "With Carbon Fee")
-plot_investment(results[["No Carbon Fee"]], "No Carbon Fee")
+#plot_investment(results[["No Carbon Fee"]], "No Carbon Fee")
 
 #--------------------- 4. UTILIZATION (one plot per scenario) ----------------------------
-for(this_scenario in SCEN_LABELS) {
-  plotdata <- results[[this_scenario]]$util_df
-  plotdata_ss <- dplyr::filter(plotdata, year %in% steady_years)
-  print(
-    ggplot(plotdata_ss, aes(x = year, y = share, color = tech)) +
-      geom_line(size = 1.2) +
-      scale_color_manual(values = color_palette) +
-      labs(
-        title = paste("Utilization by Technology (Steady State, Years", steady_state_start, "to", steady_state_end, ") -", this_scenario),
-        x = "Year", y = "Mean Capacity Utilization"
-      ) +
-      ylim(0, 1) +
-      theme_minimal() +
-      theme(legend.position = "bottom")
-  )
-}
+# for(this_scenario in SCEN_LABELS) {
+#   plotdata <- results[[this_scenario]]$util_df
+#   plotdata_ss <- dplyr::filter(plotdata, year %in% steady_years)
+#   print(
+#     ggplot(plotdata_ss, aes(x = year, y = share, color = tech)) +
+#       geom_line(size = 1.2) +
+#       scale_color_manual(values = color_palette) +
+#       labs(
+#         title = paste("Utilization by Technology (Steady State, Years", steady_state_start, "to", steady_state_end, ") -", this_scenario),
+#         x = "Year", y = "Mean Capacity Utilization"
+#       ) +
+#       ylim(0, 1) +
+#       theme_minimal() +
+#       theme(legend.position = "bottom")
+#   )
+# }
 
-#--------------------- 5. CAPACITY MIX/STACKED AREA ONE PLOT PER SCENARIO -------------
+#--------------------- 5. CAPACITY MIX/STACKED AREA ONE PLOT PER SCENARIO) ----------------------------
 plot_capacity_mix <- function(scen_results, scenario_name, color_map=color_palette) {
   Xlong <- data.frame(
     tech = rep(scen_results$techs, each = T+1),
@@ -313,7 +344,7 @@ plot_capacity_mix <- function(scen_results, scenario_name, color_map=color_palet
     theme_minimal() + theme(legend.position = "bottom")
 }
 plot_capacity_mix(results[["With Carbon Fee"]], "With Carbon Fee")
-plot_capacity_mix(results[["No Carbon Fee"]], "No Carbon Fee")
+#plot_capacity_mix(results[["No Carbon Fee"]], "No Carbon Fee")
 
 #--------------------- 6. BAR PLOT OF FINAL CAPACITY BY SCENARIO ------------------------
 capmix_df <- data.frame(
@@ -334,8 +365,7 @@ ggplot(capmix_long, aes(x=tech, y=Capacity, fill=Scenario)) +
   labs(title="Installed Capacity at Simulation End", x="Technology", y="Capacity (GW)", fill="Scenario") +
   theme_minimal()
 
-#--------------------- 7. DIFFERENCE PLOTS --------------------------------------------
-# ---- Capacity difference at simulation end STILL MAKES SENSE TO SHOW (end-of-T barplot) ----
+#--------------------- 7. DIFFERENCE IN CAPACITY ---------------------------------------
 delta_cap_df <- data.frame(
   tech = results[["With Carbon Fee"]]$techs,
   diff = results[["With Carbon Fee"]]$cap_end - results[["No Carbon Fee"]]$cap_end
@@ -348,28 +378,28 @@ ggplot(delta_cap_df, aes(x = tech, y = diff, fill = tech)) +
   theme_minimal() +
   theme(legend.position = "none")
 
-# ---- Investment difference per year in steady-state ----
-invest1 <- results[["With Carbon Fee"]]$invest_opt
-invest2 <- results[["No Carbon Fee"]]$invest_opt
-delta_invest <- invest1 - invest2
-invest_diff_df <- data.frame(
-  tech = rep(techs, each = T),
-  year = rep(1:T, times = N),
-  diff = as.vector(t(delta_invest))
-)
-# Filter for steady-state years
-invest_diff_df_ss <- dplyr::filter(invest_diff_df, year %in% steady_years)
-ggplot(invest_diff_df_ss, aes(x = year, y = diff, color = tech)) +
-  geom_line(size = 1.2) +
-  scale_color_manual(values = color_palette) +
-  labs(
-    title = paste("Difference in Annual Investment (With - Without Carbon Fee), Years", steady_state_start, "to", steady_state_end),
-    x = "Year", y = "Investment Difference (GW/year)", color = "Technology"
-  ) +
-  theme_minimal() +
-  theme(legend.position = "bottom")
+#--------------------- 8. INVESTMENT DIFFERENCE PER YEAR ----------------------------
+# invest1 <- results[["With Carbon Fee"]]$invest_opt
+# invest2 <- results[["No Carbon Fee"]]$invest_opt
+# delta_invest <- invest1 - invest2
+# invest_diff_df <- data.frame(
+#   tech = rep(techs, each = T),
+#   year = rep(1:T, times = N),
+#   diff = as.vector(t(delta_invest))
+# )
+# # Filter for steady-state years
+# invest_diff_df_ss <- dplyr::filter(invest_diff_df, year %in% steady_years)
+# ggplot(invest_diff_df_ss, aes(x = year, y = diff, color = tech)) +
+#   geom_line(size = 1.2) +
+#   scale_color_manual(values = color_palette) +
+#   labs(
+#     title = paste("Difference in Annual Investment (With - Without Carbon Fee), Years", steady_state_start, "to", steady_state_end),
+#     x = "Year", y = "Investment Difference (GW/year)", color = "Technology"
+#   ) +
+#   theme_minimal() +
+#   theme(legend.position = "bottom")
 
-# ---- Generation difference per year in steady-state ----
+#--------------------- 9. GENERATION DIFFERENCE PER YEAR ----------------------------
 gen1 <- results[["With Carbon Fee"]]$gen_opt
 gen2 <- results[["No Carbon Fee"]]$gen_opt
 delta_gen <- gen1 - gen2
@@ -390,10 +420,600 @@ ggplot(gen_diff_df_ss, aes(x = year, y = diff, color = tech)) +
   theme_minimal() +
   theme(legend.position = "bottom")
 
-#--------------------- 8. EXPORTS (EXAMPLE) -------------------------------------------
-write.csv(dfshortfall_long,         "sim_shortfall_prob_comparison.csv",         row.names=FALSE)
-write.csv(capmix_long,              "final_capacity_mix_comparison.csv",         row.names=FALSE)
-write.csv(invest_diff_df,           "investment_diff_comparison.csv",            row.names=FALSE)
-write.csv(gen_diff_df,              "generation_diff_comparison.csv",            row.names=FALSE)
+#--------------------- 10. ANNUAL SYSTEM COST DIFFERENCE OVER TIME ----------------------------
+# Define years to plot
+years_to_plot <- 1:9  
+
+df_cost_wide <- df_cost_wide %>% filter(Year %in% years_to_plot)
+
+# Remaining operations
+df_cost_wide <- df_cost_wide %>% filter(!is.na(mean_with) & !is.na(mean_no))
+
+# Scale and mutate
+scale_cost <- 1e9
+y_label_cost <- ifelse(scale_cost == 1, "Mean simulated system cost (USD)", "Mean simulated system cost (billion USD)")
+df_cost_wide <- df_cost_wide %>% mutate(across(-Year, ~ . / scale_cost))
+
+df_cost_long <- df_cost_wide %>%
+  select(Year, mean_with, mean_no) %>%
+  pivot_longer(cols = -Year, names_to = "series", values_to = "mean_cost") %>%
+  mutate(Scenario = ifelse(series == "mean_with", "With Carbon Fee", "No Carbon Fee"))
+
+# Updated color mapping
+color_map_scenarios <- c("With Carbon Fee" = "#3A4E48", "No Carbon Fee" = "#BEB0A7")
+color_map_techs <- c("Coal" = "#BEB0A7", "LNG" = "#607B8B", "Offshore Wind" = "#979461", "Solar PV" = "#CD5733")
+
+# Plot modifications:
+gg_cost <- ggplot() +
+  geom_line(data = df_cost_long, aes(x = Year, y = mean_cost, color = Scenario), size = 2.3, na.rm = TRUE) +
+  scale_color_manual(values = color_map_scenarios) +
+  labs(
+    title = "Mean Simulated Annual System Cost",
+    x = "Year",
+    y = "Mean simulated system cost (billion USD)",
+    color = "Scenario"
+  ) +
+  ylim(0, NA) +  # Set y-axis to start at 26
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "right")
+
+gg_var_stack <- ggplot(var_decomp_all, aes(x = Year, y = VarCost_USD / 1e6, fill = Tech)) +
+  geom_area(position = "stack") +
+  scale_fill_manual(values = color_map_techs) +
+  facet_wrap(~ Scenario, nrow = 2) +
+  labs(
+    title = "Per-Technology Variable Cost Contribution",
+    x = "Year",
+    y = "Variable cost (million USD)",
+    fill = "Technology"
+  ) +
+  theme_minimal()
+
+gg_var_lines <- ggplot(var_decomp_all, aes(x = Year, y = VariableCost / 1e6, color = Tech)) +
+  geom_line(size = 2.5) +
+  scale_color_manual(values = color_map_techs) +
+  facet_wrap(~ Scenario, nrow = 2) +
+  labs(
+    title = "Variable Costs by Technology",
+    x = "Year",
+    y = "Variable Costs (million USD)",
+    color = "Technology"
+  ) +
+  theme_minimal()
+
+print(gg_cost)
+
+#--------------------- 11. COST DECOMPOSITION ------------------------
+
+
+# compute deterministic investment cost per year from invest_opt
+get_invest_cost_per_year <- function(scen_res, I_vec) {
+  I_scaled <- I_vec * 1e6
+  inv_mat <- scen_res$invest_opt      # N x T
+  # investment cost per tech/year = I_scaled[i] * invest^2
+  inv_cost_by_tech_year <- sweep(inv_mat^2, 1, I_scaled, FUN="*")  # N x T
+  colSums(inv_cost_by_tech_year)      # length T
+}
+
+# compute emission cost USD per year using mean_sim_emis returned by run_scenario
+# (this assumes your run_scenario's mean_sim_emis is in the same mass unit that carbon_fee multiplies)
+get_emission_cost_per_year <- function(scen_res, carbon_fee) {
+  # if mean_sim_emis is total emission mass per year, multiply by carbon_fee to get USD
+  carbon_fee * scen_res$mean_sim_emis
+}
+
+# variable (fuel/OM) cost estimated as residual: mean_sim_cost - invest_cost - emission_cost
+get_variable_cost_per_year <- function(scen_res, I_vec, carbon_fee) {
+  inv_cost <- get_invest_cost_per_year(scen_res, I_vec)
+  emis_cost <- get_emission_cost_per_year(scen_res, carbon_fee)
+  scen_res$mean_sim_cost - inv_cost - emis_cost
+}
+
+# Build decomposition for both scenarios
+scenarios <- names(results)
+decomp_list <- list()
+for (sc in scenarios) {
+  scen_res <- results[[sc]]
+  inv_cost <- get_invest_cost_per_year(scen_res, I_vec)      # same units as mean_sim_cost
+  emis_cost <- get_emission_cost_per_year(scen_res,
+                                          ifelse(sc == "With Carbon Fee", CARBON_FEES[1], CARBON_FEES[2]))
+  var_cost <- get_variable_cost_per_year(scen_res, I_vec,
+                                         ifelse(sc == "With Carbon Fee", CARBON_FEES[1], CARBON_FEES[2]))
+  df <- data.frame(
+    Year = 1:length(scen_res$mean_sim_cost),
+    Scenario = sc,
+    Total = scen_res$mean_sim_cost,
+    Invest = inv_cost,
+    Emission = emis_cost,
+    Variable = var_cost
+  )
+  decomp_list[[sc]] <- df
+}
+decomp_df <- bind_rows(decomp_list)
+
+# Melt and plot stacked area (or lines)
+decomp_long <- decomp_df %>%
+  pivot_longer(cols = c("Invest","Emission","Variable"), names_to = "Component", values_to = "Cost")
+
+gg_decomp <- ggplot(decomp_long, aes(x = Year, y = Cost/1e9, fill = Component)) +
+  geom_area(position = "stack", alpha = 0.8) +
+  facet_wrap(~ Scenario, nrow = 2) +
+  scale_y_continuous(name = "Cost (billion USD)") +
+  labs(title = "Decomposed Mean Simulated Annual Cost by Component",
+       subtitle = "Invest / Emission / Variable (stacked). Check which component drives differences.") +
+  theme_minimal() + theme(legend.position = "bottom")
+print(gg_decomp)
+
+# Also plot component time series (lines) side-by-side for easy comparison
+gg_lines <- ggplot(decomp_long, aes(x = Year, y = Cost/1e9, color = Component)) +
+  geom_line(size = 1.1) +
+  facet_wrap(~ Scenario, nrow = 2) +
+  labs(title = "Cost components over time (lines)", y = "Cost (billion USD)") +
+  theme_minimal() + theme(legend.position = "bottom")
+print(gg_lines)
+
+# Plot difference in total cost (With Fee - No Fee)
+df_total <- decomp_df %>% select(Year, Scenario, Total) %>%
+  pivot_wider(names_from = Scenario, values_from = Total)
+df_total <- df_total %>% mutate(Diff = `With Carbon Fee` - `No Carbon Fee`)
+ggplot(df_total, aes(x = Year, y = Diff/1e9)) + geom_line(size=1.2) +
+  geom_hline(yintercept = 0, linetype=2) +
+  labs(title = "Difference in Mean Simulated Annual Cost (With Fee - No Fee)",
+       y = "Difference (billion USD)", x = "Year") + theme_minimal()
+
+# # quick table
+# print(decomp_df %>% filter(Year %in% c(1,5,10,T)) %>% arrange(Scenario, Year))
+
+# assumes results list exists and I_vec / I_scaled are available in the workspace
+I_scaled <- I_vec * 1e6
+scens <- c("With Carbon Fee","No Carbon Fee")
+
+decomp <- lapply(scens, function(sc) {
+  r <- results[[sc]]
+  # invest cost per year = sum_i I_scaled[i] * invest_opt[i,t]^2
+  invest_year <- colSums(sweep(r$invest_opt^2, 1, I_scaled, FUN="*"))
+  # emission cost per year (USD) : if r$mean_sim_emis is emission mass/year
+  carbon_fee <- ifelse(sc=="With Carbon Fee", CARBON_FEES[1], CARBON_FEES[2])
+  emis_year <- carbon_fee * r$mean_sim_emis
+  var_year  <- r$mean_sim_cost - invest_year - emis_year
+  data.frame(Year = 1:length(r$mean_sim_cost),
+             Scenario = sc,
+             Total = r$mean_sim_cost,
+             Invest = invest_year,
+             Emission = emis_year,
+             Variable = var_year,
+             CumInvestCost = cumsum(invest_year),
+             stringsAsFactors = FALSE)
+})
+decomp_df <- do.call(rbind, decomp)
+# print a selection of rows for early/mid/late years
+print(decomp_df %>% filter(Year %in% c(1,5,10,15)) %>% arrange(Scenario, Year), digits=6)
+
+#--------------------- 12. COMPARE INVESTMENT COST AND INSTALLED CAPACITY OVER TIME ---------------------
+
+scenario_colors <- c("With Carbon Fee" = "#3A4E48", "No Carbon Fee" = "#BEB0A7")
+
+# Line plot for annual investment cost (comparison)
+ggplot(decomp_df, aes(x=Year, y=Invest/1e9, color=Scenario)) +
+  geom_line(size=1.2) +
+  scale_color_manual(values = scenario_colors) +  # Apply scenario color map
+  labs(title="Annual investment cost (Bn USD)", y="Investment cost (Bn USD)", color="Scenario") +
+  theme_minimal()
+
+# Cumulative investment cost (comparison)
+ggplot(decomp_df, aes(x=Year, y=CumInvestCost/1e9, color=Scenario)) +
+  geom_line(size=1.1) +
+  scale_color_manual(values = scenario_colors) +  # Apply scenario color map
+  labs(title="Cumulative investment cost (Bn USD)", y="Cumulative invest cost (Bn USD)", color="Scenario") +
+  theme_minimal()
+
+#--------------------- 13. COMPUTE REPLACEMENT VS NET ADDITIONS AND COST COMPONENTS  ---------------------
+
+I_scaled <- I_vec * 1e6   # same scale as in model
+scens <- c("With Carbon Fee", "No Carbon Fee")
+
+comp_list <- list()
+cap_time_list <- list()
+
+for(sc in scens) {
+  r <- results[[sc]]
+  inv_mat <- r$invest_opt           # N x T
+  X_mat   <- r$X_opt                # N x (T+1)
+  
+  # replacement required in year t uses capacity at start of t (X[,t])
+  replacement <- matrix(0, nrow=nrow(inv_mat), ncol=ncol(inv_mat))
+  net_add     <- matrix(0, nrow=nrow(inv_mat), ncol=ncol(inv_mat))
+  for(t in 1:T) {
+    replacement[,t] <- eta_vec * X_mat[, t]          # GW to replace
+    net_add[,t]     <- inv_mat[,t] - replacement[,t] # GW net new (can be negative)
+  }
+  
+  # Per-tech-year cost components
+  total_inv_cost_tech <- sweep(inv_mat^2, 1, I_scaled, FUN="*")
+  rep_only_cost_tech  <- sweep(replacement^2, 1, I_scaled, FUN="*")
+  net_only_cost_tech  <- sweep(net_add^2, 1, I_scaled, FUN="*")
+  cross_term_tech     <- sweep(2 * replacement * net_add, 1, I_scaled, FUN="*")
+  
+  # Sanity check
+  check_diff <- colSums(total_inv_cost_tech - (rep_only_cost_tech + cross_term_tech + net_only_cost_tech))
+  if(any(abs(check_diff) > 1e-6)) warning("Algebraic decomposition residual not zero")
+  
+  # Aggregate across technologies
+  invest_total_by_year <- colSums(total_inv_cost_tech)
+  invest_rep_by_year   <- colSums(rep_only_cost_tech)
+  invest_cross_by_year <- colSums(cross_term_tech)
+  invest_net_by_year   <- colSums(net_only_cost_tech)
+  
+  # Defensive share: avoid division by zero
+  invest_rep_share <- ifelse(invest_total_by_year > 0, invest_rep_by_year / invest_total_by_year, NA_real_)
+  
+  comp_df <- data.frame(
+    Year = 1:T,
+    Scenario = sc,
+    Invest_Total = invest_total_by_year,
+    Invest_Replacement = invest_rep_by_year,
+    Invest_Cross = invest_cross_by_year,
+    Invest_Net = invest_net_by_year,
+    Invest_Replacement_Share = invest_rep_share,
+    stringsAsFactors = FALSE
+  )
+  comp_list[[sc]] <- comp_df
+  
+  # capacity totals
+  cap_by_year <- data.frame(Year = 0:T, TotalCap_GW = colSums(X_mat), Scenario = sc, stringsAsFactors = FALSE)
+  cap_time_list[[sc]] <- cap_by_year
+}
+
+comp_df_all <- do.call(rbind, comp_list)
+cap_df_all  <- do.call(rbind, cap_time_list)
+
+# Make sure Scenario column exactly matches names(SCEN_COLORS)
+comp_df_all$Scenario <- factor(as.character(comp_df_all$Scenario), levels = names(SCEN_COLORS))
+cap_df_all$Scenario  <- factor(as.character(cap_df_all$Scenario),  levels = names(SCEN_COLORS))
+
+# Build a safe color map that matches data levels
+data_levels <- levels(comp_df_all$Scenario)
+color_map <- SCEN_COLORS[names(SCEN_COLORS) %in% data_levels]
+# If any mismatch (fallback), create a named vector aligned with data_levels
+if(length(color_map) != length(data_levels)) {
+  color_map <- setNames(unname(SCEN_COLORS)[seq_along(data_levels)], data_levels)
+}
+
+# Print a small table with percent share (readable)
+print(
+  comp_df_all %>%
+    mutate(Invest_Replacement_Pct = percent(Invest_Replacement_Share, accuracy = 0.1)) %>%
+    filter(Year %in% c(1,5,10,T)) %>%
+    arrange(Scenario, Year),
+  digits = 6
+)
+
+# When does With-Carbon-Fee total capacity overtake No-Carbon-Fee?
+cap_w <- cap_df_all %>% filter(Scenario == "With Carbon Fee") %>% select(Year, TotalCap_GW)
+cap_n <- cap_df_all %>% filter(Scenario == "No Carbon Fee")   %>% select(Year, TotalCap_GW)
+cap_join <- merge(cap_w, cap_n, by = "Year", suffixes = c("_with","_no"))
+overtake_years <- cap_join$Year[which(cap_join$TotalCap_GW_with > cap_join$TotalCap_GW_no)]
+cat("Overtake years (With > No):", paste(overtake_years, collapse = ", "), "\n")
+
+# --- PLOTS using the safe color_map ---
+# Investment decomposition: total (solid) and replacement (dashed)
+gg_inv_decomp <- ggplot(comp_df_all, aes(x = Year, group = Scenario)) +
+  geom_line(aes(y = Invest_Total/1e9, color = Scenario), size = 1.1) +
+  geom_line(aes(y = Invest_Replacement/1e9, color = Scenario), linetype = "dashed", size = 1) +
+  scale_color_manual(values = color_map) +
+  labs(title = "Investment cost: total (solid) and replacement (dashed)", y = "Investment (Bn USD)") +
+  theme_minimal() + theme(legend.position = "bottom")
+print(gg_inv_decomp)
+
+
+# Capacity comparison (years 1..T)
+gg_cap <- ggplot(cap_df_all %>% filter(Year > 0), aes(x = Year, y = TotalCap_GW, color = Scenario)) +
+  geom_line(size = 1.1) +
+  scale_color_manual(values = color_map) +
+  labs(title = "Total installed capacity over time (GW)", y = "Capacity (GW)") +
+  theme_minimal() + theme(legend.position = "right")
+print(gg_cap)
+
+#---------------------  14. VARIABLE COST DECOMPOSITION BY TECHNOLOGY ----------------------------------
+
+# Parameters used for unit conversions (must match your script)
+gen_scale <- 1e3   # convert GWh -> MWh (multiply GWh * gen_scale)
+# c_vec is USD per MWh (from the script), emissions is mass per MWh (matches earlier use)
+
+# Ensure the returned objects exist
+stopifnot(!is.null(results), length(results) >= 1)
+scenarios <- names(results)
+
+# Build per-scenario per-tech variable cost decomposition
+var_decomp_by_scn <- list()
+for (sc in scenarios) {
+  r <- results[[sc]]
+  # Expect mean_gen_by_tech_year: currently produced as sapply(1:N, function(i) colMeans(...))
+  # We want a data.frame tech x Year with mean generation in MWh
+  if (is.null(r$mean_gen_by_tech_year)) stop("mean_gen_by_tech_year not found in results for scenario: ", sc)
+  
+  # r$mean_gen_by_tech_year structure: columns = years, rows = tech index (if using sapply above)
+  # Make it explicit as matrix with dims N x T
+  # If it's returned as a list or matrix, coerce robustly:
+  mg <- as.matrix(r$mean_gen_by_tech_year)  # dimensions might be T x N or N x T
+  # Detect orientation: if nrow == T then transpose
+  if (nrow(mg) == length(r$mean_sim_cost)) mg <- t(mg)  # make rows = tech, cols = Year
+  # Now mg[i, t] = mean generation (GWh) for tech i in year t
+  mean_gen_gwh <- mg
+  mean_gen_mwh <- mean_gen_gwh * gen_scale  # convert to MWh
+  
+  # compute per-tech-year variable cost and emission cost
+  # c_vec is USD per MWh; emissions is mass per MWh (or per MWh compatible with earlier usage)
+  # Make sure c_vec and emissions are in the workspace
+  stopifnot(length(c_vec) == nrow(mean_gen_mwh))
+  stopifnot(length(emissions) == nrow(mean_gen_mwh))
+  
+  # variable cost (USD) per tech-year
+  var_cost_mat <- sweep(mean_gen_mwh, 1, c_vec, FUN = "*")        # N x T (USD)
+  emis_cost_mat <- sweep(mean_gen_mwh, 1, emissions, FUN = "*")   # mass × MWh
+  # Convert emission mass to USD using carbon fee for this scenario:
+  cf <- ifelse(sc == "With Carbon Fee", CARBON_FEES[1], CARBON_FEES[2])
+  emis_cost_usd_mat <- emis_cost_mat * cf                             # USD
+  
+  # Build tidy data.frame
+  df_list <- list()
+  Ntech <- nrow(mean_gen_mwh); Tlen <- ncol(mean_gen_mwh)
+  tech_names <- results[[sc]]$techs
+  for (i in 1:Ntech) {
+    df_list[[i]] <- data.frame(
+      Scenario = sc,
+      Tech = tech_names[i],
+      Year = 1:Tlen,
+      MeanGen_GWh = mean_gen_gwh[i, ],
+      MeanGen_MWh = mean_gen_mwh[i, ],
+      VarCost_USD = var_cost_mat[i, ],
+      EmisCost_USD = emis_cost_usd_mat[i, ],
+      stringsAsFactors = FALSE
+    )
+  }
+  df_var_by_tech <- bind_rows(df_list)
+  
+  # total variable cost across techs by year
+  total_var_by_year <- df_var_by_tech %>% group_by(Year) %>% summarise(TotalVar_USD = sum(VarCost_USD))
+  # proportions per tech
+  df_var_by_tech <- df_var_by_tech %>% left_join(total_var_by_year, by = "Year") %>%
+    mutate(VarShare = ifelse(TotalVar_USD > 0, VarCost_USD / TotalVar_USD, NA_real_))
+  
+  var_decomp_by_scn[[sc]] <- df_var_by_tech
+}
+
+# Combine scenarios for plotting
+var_decomp_all <- bind_rows(var_decomp_by_scn)
+
+# Save CSV of per-tech variable cost (wide and long)
+# long CSV
+write.csv(var_decomp_all, file = file.path("outputs", "tables", paste0("per_tech_variable_cost_long_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv")), row.names = FALSE)
+# wide by tech: one file per scenario
+for (sc in scenarios) {
+  dfw <- var_decomp_by_scn[[sc]] %>%
+    select(Tech, Year, MeanGen_GWh, VarCost_USD, EmisCost_USD) %>%
+    pivot_wider(names_from = Year, values_from = c(MeanGen_GWh, VarCost_USD, EmisCost_USD))
+  fn <- file.path("outputs", "tables", paste0("per_tech_variable_cost_wide_", gsub(" ", "_", sc), "_", format(Sys.time(), "%Y%m%d_%H%M%S"), ".csv"))
+  write.csv(dfw, fn, row.names = FALSE)
+}
+
+# Plot 1: stacked area of variable cost contributions by technology (one facet per scenario)
+gg_var_stack <- ggplot(var_decomp_all, aes(x = Year, y = VarCost_USD / 1e6, fill = Tech)) +   # show cost in million USD
+  geom_area(position = "stack") +
+  facet_wrap(~ Scenario, nrow = 2) +
+  labs(title = "Per-technology Variable Cost Contribution (mean simulation)",
+       y = "Variable cost (million USD)", x = "Year") +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  scale_y_continuous(labels = scales::comma)+
+  scale_color_manual(values = TECH_COLORS)+
+  scale_fill_manual(values = TECH_COLORS)
+
+print(gg_var_stack)
+
+
+
+# Plot 2: lines of each tech's variable cost (comparison across scenarios)
+df_lines <- var_decomp_all %>% group_by(Scenario, Tech, Year) %>% summarise(VarCost_USD = sum(VarCost_USD), .groups="drop")
+gg_var_lines <- ggplot(df_lines, aes(x = Year, y = VarCost_USD / 1e6, color = Tech, linetype = Scenario)) +
+  geom_line(size = 1) +
+  labs(title = "Per-technology variable cost over time (mean simulation)", y = "Variable cost (million USD)") +
+  theme_minimal() +
+  theme(legend.position = "bottom")+
+  scale_color_manual(values = TECH_COLORS)+
+  scale_fill_manual(values = TECH_COLORS)
+print(gg_var_lines)
+
+#summary costs
+summary_var_costs <- var_costs_all %>%
+  group_by(Scenario, Tech) %>%
+  summarise(TotalVariableCost = sum(VariableCost), .groups = "drop")
+
+
+#--------------------- 15. EXPORTS -------------------------------------------
+
+out_dir <- "outputs"
+dir_map <- list(
+  tables = file.path(out_dir, "tables"),
+  plots  = file.path(out_dir, "plots"),
+  rds    = file.path(out_dir, "rds"),
+  csv    = file.path(out_dir, "csv"),
+  per_tech_plots = file.path(out_dir, "plots", "per_tech")
+)
+# create directories
+invisible(lapply(dir_map, function(d) dir.create(d, recursive = TRUE, showWarnings = FALSE)))
+
+ts <- format(Sys.time(), "%Y%m%d_%H%M%S")
+
+# --- Helper functions ---
+safe_write_csv <- function(x, filename) {
+  if (!is.null(x)) {
+    tryCatch({
+      write.csv(x, file = filename, row.names = FALSE)
+      message("Wrote CSV: ", filename)
+    }, error = function(e) message("Failed CSV write: ", filename, " : ", e$message))
+  } else message("NULL object, skipped CSV: ", filename)
+}
+
+safe_save_rds <- function(obj, filename) {
+  if (!is.null(obj)) {
+    tryCatch({
+      saveRDS(obj, file = filename)
+      message("Saved RDS: ", filename)
+    }, error = function(e) message("Failed RDS save: ", filename, " : ", e$message))
+  } else message("NULL object, skipped RDS: ", filename)
+}
+
+safe_save_plot <- function(plot_obj, filename, w = 10, h = 6, dpi = 300) {
+  if (!is.null(plot_obj)) {
+    tryCatch({
+      ggsave(filename = filename, plot = plot_obj, width = w, height = h, dpi = dpi)
+      message("Saved plot PNG: ", filename)
+    }, error = function(e) message("Failed saving plot ", filename, " : ", e$message))
+  } else message("Plot object is NULL, skipped: ", filename)
+}
+
+# --- 1) Save results list and per-scenario RDS ---
+if (exists("results") && !is.null(results)) {
+  safe_save_rds(results, file.path(dir_map$rds, paste0("results_all_", ts, ".rds")))
+  for (sc in names(results)) {
+    sc_safe <- gsub("\\s+", "_", sc)
+    safe_save_rds(results[[sc]], file.path(dir_map$rds, paste0("results_", sc_safe, "_", ts, ".rds")))
+  }
+} else {
+  message("No 'results' object found or it is NULL; skipping saving results RDS.")
+}
+
+# --- 2) Save commonly used tables (if present) ---
+if (exists("decomp_df")) safe_write_csv(decomp_df, file.path(dir_map$tables, paste0("decomposition_table_", ts, ".csv")))
+if (exists("comp_df_all")) safe_write_csv(comp_df_all, file.path(dir_map$tables, paste0("invest_decomp_by_year_", ts, ".csv")))
+if (exists("cap_df_all")) safe_write_csv(cap_df_all, file.path(dir_map$tables, paste0("capacity_time_series_", ts, ".csv")))
+if (exists("theta_scaling_table")) safe_write_csv(theta_scaling_table, file.path(dir_map$tables, paste0("theta_scaling_table_", ts, ".csv")))
+if (exists("dfshortfall_long")) safe_write_csv(dfshortfall_long, file.path(dir_map$tables, paste0("shortfall_prob_long_", ts, ".csv")))
+if (exists("capmix_long")) safe_write_csv(capmix_long, file.path(dir_map$tables, paste0("final_capacity_mix_long_", ts, ".csv")))
+if (exists("invest_diff_df")) safe_write_csv(invest_diff_df, file.path(dir_map$tables, paste0("invest_diff_long_", ts, ".csv")))
+if (exists("gen_diff_df")) safe_write_csv(gen_diff_df, file.path(dir_map$tables, paste0("gen_diff_long_", ts, ".csv")))
+
+# --- 3) Save raw simulation matrices and summary CSVs per scenario ---
+if (exists("results") && !is.null(results)) {
+  for (sc in names(results)) {
+    sc_res <- results[[sc]]
+    sc_safe <- gsub("\\s+", "_", sc)
+    if (!is.null(sc_res$sim_cost_per_year)) safe_write_csv(as.data.frame(sc_res$sim_cost_per_year),
+                                                           file.path(dir_map$csv, paste0("sim_cost_per_year_", sc_safe, "_", ts, ".csv")))
+    if (!is.null(sc_res$sim_total_prod)) safe_write_csv(as.data.frame(sc_res$sim_total_prod),
+                                                        file.path(dir_map$csv, paste0("sim_total_prod_", sc_safe, "_", ts, ".csv")))
+    if (!is.null(sc_res$mean_sim_cost)) safe_write_csv(data.frame(Year = seq_along(sc_res$mean_sim_cost), MeanSimCost = sc_res$mean_sim_cost),
+                                                       file.path(dir_map$csv, paste0("mean_sim_cost_", sc_safe, "_", ts, ".csv")))
+    if (!is.null(sc_res$mean_sim_total_prod)) safe_write_csv(data.frame(Year = seq_along(sc_res$mean_sim_total_prod), MeanSimTotalProd_GWh = sc_res$mean_sim_total_prod),
+                                                             file.path(dir_map$csv, paste0("mean_sim_total_prod_", sc_safe, "_", ts, ".csv")))
+  }
+}
+
+# --- 4) Per-technology matrices (invest_opt, X_opt) ---
+if (exists("results") && !is.null(results)) {
+  for (sc in names(results)) {
+    sc_res <- results[[sc]]
+    sc_safe <- gsub("\\s+", "_", sc)
+    if (!is.null(sc_res$invest_opt)) {
+      inv_mat <- sc_res$invest_opt
+      inv_df_wide <- data.frame(tech = sc_res$techs, inv_mat)
+      colnames(inv_df_wide)[-1] <- paste0("Year", 1:ncol(inv_mat))
+      safe_write_csv(inv_df_wide, file.path(dir_map$tables, paste0("invest_opt_wide_", sc_safe, "_", ts, ".csv")))
+      inv_df_long <- data.frame(tech = rep(sc_res$techs, each = ncol(inv_mat)), Year = rep(1:ncol(inv_mat), times = nrow(inv_mat)), Invest_GW = as.vector(t(inv_mat)))
+      safe_write_csv(inv_df_long, file.path(dir_map$tables, paste0("invest_opt_long_", sc_safe, "_", ts, ".csv")))
+    }
+    if (!is.null(sc_res$X_opt)) {
+      X_mat <- sc_res$X_opt
+      X_df_wide <- data.frame(tech = sc_res$techs, X_mat)
+      colnames(X_df_wide)[-1] <- paste0("Year", 0:(ncol(X_mat)-1))
+      safe_write_csv(X_df_wide, file.path(dir_map$tables, paste0("X_opt_wide_", sc_safe, "_", ts, ".csv")))
+    }
+  }
+}
+
+
+
+write.csv(summary_var_costs, "summary_variable_costs.csv", row.names = FALSE)
+
+#export
+write.csv(var_costs_all, "variable_costs_per_technology.csv", row.names = FALSE)
+
+# --- 5) Save plots (if ggplot objects exist) ---
+# Modify these names if your plot objects have different variable names in workspace.
+plot_objects <- list(
+  gg_decomp = file.path(dir_map$plots, paste0("plot_decomposed_components_", ts, ".png")),
+  gg_lines = file.path(dir_map$plots, paste0("plot_components_lines_", ts, ".png")),
+  gg_cost = file.path(dir_map$plots, paste0("plot_system_cost_comparison_", ts, ".png")),
+  gg_shortfall = file.path(dir_map$plots, paste0("plot_shortfall_probability_", ts, ".png")),
+  gg_gen = file.path(dir_map$plots, paste0("plot_realized_generation_", ts, ".png")),
+  gg_inv_decomp = file.path(dir_map$plots, paste0("plot_invest_decomposition_", ts, ".png")),
+  gg_rep_share = file.path(dir_map$plots, paste0("plot_replacement_share_", ts, ".png")),
+  gg_cap = file.path(dir_map$plots, paste0("plot_capacity_time_series_", ts, ".png"))
+)
+for (nm in names(plot_objects)) {
+  if (exists(nm, envir = .GlobalEnv)) {
+    safe_save_plot(get(nm, envir = .GlobalEnv), plot_objects[[nm]])
+  } else {
+    message("Plot object not present, skipping: ", nm)
+  }
+}
+
+# Per-tech plots
+if (exists("results") && !is.null(results)) {
+  for (sc in names(results)) {
+    r <- results[[sc]]
+    sc_safe <- gsub("\\s+", "_", sc)
+    if (!is.null(r$invest_opt)) {
+      inv_mat <- r$invest_opt
+      inv_df_long <- data.frame(tech = rep(r$techs, each = ncol(inv_mat)), Year = rep(1:ncol(inv_mat), times = nrow(inv_mat)), Invest_GW = as.vector(t(inv_mat)))
+      for (tch in unique(inv_df_long$tech)) {
+        p <- ggplot(inv_df_long %>% dplyr::filter(tech == tch), aes(x = Year, y = Invest_GW)) + geom_line() +
+          labs(title = paste("Invest by year -", tch, "-", sc), y = "Invest (GW)") + theme_minimal()
+        outfn <- file.path(dir_map$per_tech_plots, paste0("invest_", sc_safe, "_", gsub("[ /]", "_", tch), "_", ts, ".png"))
+        safe_save_plot(p, outfn, w = 8, h = 3.5)
+      }
+    }
+  }
+}
+
+
+# --- 6) Save R objects (RDS) for key dataframes if present ---
+if (exists("comp_df_all")) safe_save_rds(comp_df_all, file.path(dir_map$rds, paste0("comp_df_all_", ts, ".rds")))
+if (exists("cap_df_all")) safe_save_rds(cap_df_all, file.path(dir_map$rds, paste0("cap_df_all_", ts, ".rds")))
+if (exists("decomp_df")) safe_save_rds(decomp_df, file.path(dir_map$rds, paste0("decomp_df_", ts, ".rds")))
+
+# --- 7) Zip the entire outputs folder into a single archive ---
+zipfile <- file.path(out_dir, paste0("outputs_", ts, ".zip"))
+all_files <- list.files(out_dir, recursive = TRUE, full.names = TRUE)
+
+if (length(all_files) == 0) {
+  message("No files to zip in ", out_dir)
+} else {
+  zip_success <- FALSE
+  # Prefer 'zip' package (no external binary needed) if available
+  if (requireNamespace("zip", quietly = TRUE)) {
+    tryCatch({
+      zip::zip(zipfile, files = all_files, mode = "cherry-pick")
+      message("Created zip using zip::zip: ", zipfile)
+      zip_success <- TRUE
+    }, error = function(e) message("zip::zip failed: ", e$message))
+  }
+  # Fallback to utils::zip (may require external zip executable on some systems)
+  if (!zip_success) {
+    tryCatch({
+      # utils::zip expects file paths relative to working dir when using recursive = FALSE
+      # Use full paths here; on some systems utils::zip will call an external zip tool.
+      utils::zip(zipfile, files = all_files)
+      message("Created zip using utils::zip: ", zipfile)
+      zip_success <- TRUE
+    }, error = function(e) message("utils::zip failed: ", e$message))
+  }
+  if (!zip_success) {
+    message("Failed to create zip archive. Files are still available in the '", out_dir, "' folder.")
+  }
+}
+
+message("Export + (attempted) compression completed. Check the '", out_dir, "' folder.")
 
 #--------------------- END -----------------------------------------------------------
