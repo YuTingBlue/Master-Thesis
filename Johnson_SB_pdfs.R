@@ -1,7 +1,5 @@
 # Johnson SB PDFs - rescale all theta distributions using LNG scaling factor
 # Output summary includes: mean, median, sd, skewness, kurtosis, Q1, Q3
-# Updated to print both original and uniformly scaled (LNG) summary stats
-# Updated: 2025-12-16
 
 library(moments)
 library(ggplot2)
