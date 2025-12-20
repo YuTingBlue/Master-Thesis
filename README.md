@@ -1,5 +1,4 @@
-## Balancing Security, Cost, and Emissions: Modelling Taiwan’s Electricity Transition
-### Accompanying repository for thesis
+### Balancing Security, Cost, and Emissions: Modelling Taiwan’s Electricity Transition
 
 This repository contains all R scripts and input datasets used for this thesis.
 
